@@ -104,14 +104,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          branch="mforce/security-reports"
+          branch="mforce/security-report-${GITHUB_RUN_ID}"
           git config user.name "${APP_SLUG}[bot]"
           bot_user_id="$(gh api "/users/${APP_SLUG}[bot]" --jq .id)"
           git config user.email "${bot_user_id}+${APP_SLUG}[bot]@users.noreply.github.com"
           git checkout -b "$branch"
           git add security-reports/
           git commit -m "docs(security): record scheduled scan $GITHUB_RUN_ID"
-          git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)" push origin "HEAD:refs/heads/$branch" --force-with-lease
-          if ! gh pr view "$branch" --json number >/dev/null 2>&1; then
-            gh pr create --base main --head "$branch" --title "docs(security): automated scan reports" --body "Timestamped reports for each scheduled/manual run. Review before merging. Checks are limited to workflow top-level write-all and Python syntax."
-          fi
+          git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)" push origin "HEAD:refs/heads/$branch"
+          gh pr create --base main --head "$branch" --title "docs(security): automated scan report $GITHUB_RUN_ID" --body "Timestamped report for this scan run. Review before merging. Checks are limited to workflow top-level write-all and Python syntax."
