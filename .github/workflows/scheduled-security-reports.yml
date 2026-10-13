@@ -1,0 +1,117 @@
+name: MForce scheduled security reports
+
+on:
+  workflow_dispatch:
+  schedule:
+    # UTC candidates; Berlin time is checked below (DST-aware).
+    - cron: '0 10,11,22,23 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mforce-scheduled-security-reports
+  cancel-in-progress: false
+
+jobs:
+  scan-and-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check Berlin schedule
+        id: time
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 - <<'PY'
+          import datetime, os
+          from zoneinfo import ZoneInfo
+          now = datetime.datetime.now(ZoneInfo("Europe/Berlin"))
+          allowed = os.environ["EVENT_NAME"] == "workflow_dispatch" or now.hour in (0, 12)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"run={'true' if allowed else 'false'}\n")
+          print(f"Berlin time: {now.isoformat()}, execute: {allowed}")
+          PY
+      - name: Checkout repository
+        if: steps.time.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Scan and write timestamped report
+        if: steps.time.outputs.run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p security-reports
+          python3 - <<'PY'
+          import datetime, pathlib, re, subprocess
+          from zoneinfo import ZoneInfo
+          root = pathlib.Path(".")
+          now = datetime.datetime.now(ZoneInfo("Europe/Berlin"))
+          findings = []
+          checked = 0
+          for path in root.rglob("*"):
+              if not path.is_file() or ".git" in path.parts or "security-reports" in path.parts:
+                  continue
+              if path.suffix not in {".yml", ".yaml", ".py", ".sh"}:
+                  continue
+              if path.stat().st_size > 1_000_000:
+                  continue
+              checked += 1
+              data = path.read_text(encoding="utf-8", errors="replace")
+              if path.suffix in {".yml", ".yaml"}:
+                  for n, line in enumerate(data.splitlines(), 1):
+                      if re.match(r"^permissions:\s*write-all\s*$", line):
+                          findings.append(f"{path}:{n}: broad top-level permissions: write-all")
+              if path.suffix == ".py":
+                  result = subprocess.run(["python3", "-m", "py_compile", str(path)], capture_output=True, text=True)
+                  if result.returncode:
+                      findings.append(f"{path}: Python syntax check failed")
+          stamp = now.strftime("%Y-%m-%d_%H-%M-%S")
+          output = root / "security-reports" / f"{stamp}_berlin_run-{__import__('os').environ['GITHUB_RUN_ID']}.md"
+          status = "Auffaelligkeiten erkannt" if findings else "Keine Auffaelligkeiten in den ausgefuehrten Checks"
+          lines = [
+              "# MForce security scan report", "",
+              f"- Zeitpunkt (Europe/Berlin): {now.isoformat()}",
+              f"- UTC: {now.astimezone(datetime.timezone.utc).isoformat()}",
+              f"- GitHub Run ID: {__import__('os').environ['GITHUB_RUN_ID']}",
+              f"- Gepruefte Dateien: {checked}",
+              f"- Ergebnis: **{status}**", "",
+              "## Findings", "",
+              *( [f"- {finding}" for finding in findings] if findings else ["- Keine Funde in den implementierten Checks."] ),
+              "", "## Scope", "",
+              "Prueft breite Top-Level-Workflow-Berechtigungen und Python-Syntax.",
+              "Kein vollstaendiger Vulnerability-, Dependency- oder Secret-Scan.",
+              "Ein unauffaelliger Bericht garantiert keine Sicherheit.", ""
+          ]
+          output.write_text("\n".join(lines), encoding="utf-8")
+          print(output, status)
+          PY
+      - name: Generate GitHub App token
+        if: steps.time.outputs.run == 'true'
+        id: app
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.MFORCE_APP_ID }}
+          private-key: ${{ secrets.MFORCE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Create bot-authored report PR
+        if: steps.time.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+          APP_ID: ${{ steps.app.outputs.app-id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch="mforce/security-reports"
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${APP_ID}+${APP_SLUG}[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add security-reports/
+          git commit -m "docs(security): record scheduled scan $GITHUB_RUN_ID"
+          git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)" push origin "HEAD:refs/heads/$branch" --force-with-lease
+          if ! gh pr view "$branch" --json number >/dev/null 2>&1; then
+            gh pr create --base main --head "$branch" --title "docs(security): automated scan reports" --body "Timestamped reports for each scheduled/manual run. Review before merging. Checks are limited to workflow top-level write-all and Python syntax."
+          fi
