@@ -1,0 +1,120 @@
+name: MForce Enhanced Framework scheduled security scan
+
+on:
+  workflow_dispatch:
+  schedule:
+    # UTC candidates for 00:00 and 12:00 Europe/Berlin.
+    - cron: '0 10,11,22,23 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mforce-framework-scan
+  cancel-in-progress: false
+
+jobs:
+  scan-framework:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check Berlin schedule
+        id: time
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import datetime, os
+          from zoneinfo import ZoneInfo
+          now = datetime.datetime.now(ZoneInfo("Europe/Berlin"))
+          allowed = os.environ["EVENT_NAME"] == "workflow_dispatch" or (now.hour in (0, 12) and now.minute < 30)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"run={'true' if allowed else 'false'}\n")
+          print(f"Berlin: {now.isoformat()}, run: {allowed}")
+          PY
+      - name: Generate framework installation token
+        if: steps.time.outputs.run == 'true'
+        id: app
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.MFORCE_APP_ID }}
+          private-key: ${{ secrets.MFORCE_APP_PRIVATE_KEY }}
+          owner: GotUrBack-Public
+          repositories: MForce-Enhanced-Framework
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Checkout framework default branch
+        if: steps.time.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: GotUrBack-Public/MForce-Enhanced-Framework
+          ref: main
+          token: ${{ steps.app.outputs.token }}
+          persist-credentials: false
+          path: framework
+      - name: Scan framework and create report
+        if: steps.time.outputs.run == 'true'
+        working-directory: framework
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p security-reports
+          python3 - <<'PY'
+          import datetime, os, pathlib, re, subprocess
+          from zoneinfo import ZoneInfo
+          now = datetime.datetime.now(ZoneInfo("Europe/Berlin"))
+          findings = []
+          count = 0
+          for path in pathlib.Path(".").rglob("*"):
+              if not path.is_file() or any(part in {".git", "security-reports", "node_modules", ".venv", "venv"} for part in path.parts):
+                  continue
+              if path.suffix not in {".py", ".yml", ".yaml", ".sh"} or path.stat().st_size > 1_000_000:
+                  continue
+              count += 1
+              if path.suffix in {".yaml", ".yml"} and ".github" in path.parts and "workflows" in path.parts:
+                  for number, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                      if re.match(r"^permissions:\s*write-all\s*$", line):
+                          findings.append(f"{path}:{number}: broad workflow permissions: write-all")
+              if path.suffix == ".py":
+                  result = subprocess.run(["python3", "-m", "py_compile", str(path)], capture_output=True, text=True)
+                  if result.returncode:
+                      findings.append(f"{path}: Python syntax check failed")
+          report = pathlib.Path("security-reports") / f"{now:%Y-%m-%d_%H-%M-%S}_berlin_run-{os.environ['GITHUB_RUN_ID']}.md"
+          status = "Auffaelligkeiten erkannt" if findings else "Keine Auffaelligkeiten in den ausgefuehrten Checks"
+          lines = [
+              "# MForce Enhanced Framework security report", "",
+              f"- Repository: GotUrBack-Public/MForce-Enhanced-Framework",
+              f"- Zeitpunkt (Europe/Berlin): {now.isoformat()}",
+              f"- UTC: {now.astimezone(datetime.timezone.utc).isoformat()}",
+              f"- GitHub Actions Run: {os.environ['GITHUB_RUN_ID']}",
+              f"- Gepruefte Dateien: {count}",
+              f"- Ergebnis: **{status}**", "",
+              "## Findings", "",
+              *([f"- {item}" for item in findings] if findings else ["- Keine Funde in den implementierten Checks."]),
+              "", "## Scope", "",
+              "Prueft breite Workflow-Berechtigungen und Python-Syntax.",
+              "Kein vollstaendiger Schwachstellen-, Dependency- oder Secret-Scan.",
+              "Ein unauffaelliger Bericht garantiert keine Sicherheit.", ""
+          ]
+          report.write_text("\n".join(lines), encoding="utf-8")
+          print(report, status)
+          PY
+      - name: Open framework report pull request as bot
+        if: steps.time.outputs.run == 'true'
+        working-directory: framework
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch="mforce/framework-report-${GITHUB_RUN_ID}"
+          git config user.name "${APP_SLUG}[bot]"
+          bot_user_id="$(gh api "/users/${APP_SLUG}[bot]" --jq .id)"
+          git config user.email "${bot_user_id}+${APP_SLUG}[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add security-reports/
+          git commit -m "docs(security): framework scan report $GITHUB_RUN_ID"
+          git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)" push origin "HEAD:refs/heads/$branch"
+          gh pr create --repo GotUrBack-Public/MForce-Enhanced-Framework --base main --head "$branch" --title "docs(security): framework scan report $GITHUB_RUN_ID" --body "Automated MForce security report for this scan. Review before merging. Checks cover broad workflow permissions and Python syntax only."
