@@ -101,13 +101,13 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           APP_SLUG: ${{ steps.app.outputs.app-slug }}
-          APP_ID: ${{ steps.app.outputs.app-id }}
         shell: bash
         run: |
           set -euo pipefail
           branch="mforce/security-reports"
           git config user.name "${APP_SLUG}[bot]"
-          git config user.email "${APP_ID}+${APP_SLUG}[bot]@users.noreply.github.com"
+          bot_user_id="$(gh api "/users/${APP_SLUG}[bot]" --jq .id)"
+          git config user.email "${bot_user_id}+${APP_SLUG}[bot]@users.noreply.github.com"
           git checkout -b "$branch"
           git add security-reports/
           git commit -m "docs(security): record scheduled scan $GITHUB_RUN_ID"
